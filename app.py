@@ -163,7 +163,7 @@ def generate_report1(df_cust):
     return grp
 
 def generate_report2(df_cust, company_list):
-    # compute sums by Parent Manufacturer
+    # compute sums by Parent Manufacturer using customer-filtered df (df_cust)
     summary = (df_cust.groupby("Parent Manufacturer")
                .agg(Total_Qty=("Qty", "sum"), Total_Value=("Value", "sum"))
                .reset_index())
@@ -260,7 +260,8 @@ with tab2:
 
     # Report 2
     st.subheader("Report 2 — Company-wise Purchases (includes 0-sales companies, sorted by Total Value ↓)")
-    rpt2 = generate_report2(sales_df, company_list)
+    # << FIXED: use cust_df (customer-filtered) instead of whole sales_df >>
+    rpt2 = generate_report2(cust_df, company_list)
     st.dataframe(rpt2, use_container_width=True, hide_index=True)
 
-    st.caption("Files persist in ./data/ until replaced. Upload new files in the Upload tab to refresh globally.")
+    st.caption("Created by Jinesh | Sanjay Distributors")
