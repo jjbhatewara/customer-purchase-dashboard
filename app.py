@@ -1,204 +1,202 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import io
 import re
-from datetime import datetime
-from dateutil import parser
 
-st.set_page_config(page_title="Customer Purchase Reports Dashboard", layout="wide")
+# -------------------------
+# Streamlit Page Config
+# -------------------------
+st.set_page_config(
+    page_title="Customer Purchase Dashboard",
+    layout="wide",
+    page_icon="📊"
+)
 
-st.title("Customer Purchase Reports Dashboard")
+# -------------------------
+# Global Styling (Dark UI)
+# -------------------------
+st.markdown("""
+    <style>
+        .reportview-container, .stApp {
+            background-color: #0E1117;
+            color: #FAFAFA;
+        }
+        h1, h2, h3, h4 {
+            color: #00B4D8;
+        }
+        div[data-testid="stExpander"] div[role="button"] {
+            color: #00B4D8;
+        }
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        .stTabs [data-baseweb="tab"] {
+            color: #FAFAFA;
+            background-color: #1E1E1E;
+        }
+        .stTabs [aria-selected="true"] {
+            color: #00B4D8;
+            background-color: #2B2B2B;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-# Utility functions
-@st.cache_data
-def load_excel(file):
-    # Attempt to read data starting from row 4 (skip first 3 rows)
-    preview = pd.read_excel(uploaded_file, nrows=5, header=None)
 
-    # Find the row index that contains "Product Name" or "Qty"
-    header_row = None
+# -------------------------
+# Helper Functions
+# -------------------------
+def detect_header_row(file):
+    """Detects which row contains the header (looks for Product or Qty)."""
+    preview = pd.read_excel(file, nrows=6, header=None)
     for i, row in preview.iterrows():
         if row.astype(str).str.contains(r'(?i)product|qty').any():
-            header_row = i
-            break
+            return i
+    return 0
 
-    # Now read the full file with the detected header
-    if header_row is not None:
-        df = pd.read_excel(uploaded_file, header=header_row)
+
+def load_sales_data(uploaded_file):
+    """Reads and cleans sales data."""
+    header_row = detect_header_row(uploaded_file)
+    df = pd.read_excel(uploaded_file, header=header_row)
+
+    # Extract period info
+    uploaded_file.seek(0)
+    preview_lines = pd.read_excel(uploaded_file, nrows=3, header=None).astype(str)
+    text = " ".join(preview_lines.iloc[:, 0].dropna())
+    date_match = re.search(r"From\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4}).*Upto\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4})", text)
+    period = None
+    if date_match:
+        period = f"{date_match.group(1)} → {date_match.group(2)}"
+
+    # Normalize column names
+    df.columns = df.columns.str.strip().str.replace(r'\n', ' ', regex=True)
+    df.rename(columns=lambda x: str(x).strip().title(), inplace=True)
+
+    expected_cols = [
+        "Product Name", "Qty", "Free", "Rate", "Grsamt",
+        "Invno", "Ledger Account", "Parent Manufacture"
+    ]
+    for c in expected_cols:
+        if c not in df.columns:
+            matches = [col for col in df.columns if c.split()[0].lower() in col.lower()]
+            if matches:
+                df.rename(columns={matches[0]: c}, inplace=True)
+
+    numeric_cols = ["Qty", "Free", "Rate", "Grsamt"]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    return df, period
+
+
+def load_company_list(uploaded_file):
+    """Loads the All Company List file (2 columns, both Parent Manufacturers)."""
+    header_row = detect_header_row(uploaded_file)
+    df = pd.read_excel(uploaded_file, header=header_row)
+    all_companies = pd.unique(df.iloc[:, 0].dropna().astype(str).tolist() +
+                              df.iloc[:, 1].dropna().astype(str).tolist())
+    all_companies = [x.strip().upper() for x in all_companies]
+    return sorted(set(all_companies))
+
+
+def generate_reports(df, company_list, selected_customer):
+    """Generates both reports based on selected customer."""
+    cust_df = df[df["Ledger Account"] == selected_customer]
+
+    # --- Report 1: Frequent Purchases ---
+    report1 = (cust_df.groupby(["Product Name", "Parent Manufacture"])
+               .agg({"Invno": "nunique", "Qty": ["max", "mean"]})
+               .reset_index())
+    report1.columns = ["Product Name", "Parent Manufacture",
+                       "No. of Instances", "Max Purchases", "Avg Purchases"]
+    report1["Avg Purchases"] = report1["Avg Purchases"].round(2)
+    report1 = report1.sort_values("Avg Purchases", ascending=False)
+
+    # --- Report 2: Company-wise Purchases ---
+    if "Parent Manufacture" not in cust_df.columns:
+        report2 = pd.DataFrame(columns=["Parent Manufacture", "Total Qty", "Total Value"])
     else:
-        df = pd.read_excel(uploaded_file)
-    return df
+        comp_df = cust_df.copy()
+        comp_df["Parent Manufacture"] = comp_df["Parent Manufacture"].astype(str).str.upper()
 
-def infer_date_range_from_header(file):
-    # Read first few rows as raw text to find patterns like 'From : dd/mm/yy Upto : dd/mm/yy'
-    try:
-        raw = pd.read_excel(file, nrows=3, header=None).astype(str).fillna('')
-        joined = " ".join(raw.stack().tolist())
-        m = re.search(r'From\s*:?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s*Upto\s*:?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})', joined, re.IGNORECASE)
-        if m:
-            d1 = parser.parse(m.group(1), dayfirst=True)
-            d2 = parser.parse(m.group(2), dayfirst=True)
-            return d1, d2
-    except Exception:
-        pass
-    return None, None
+        summary = (comp_df.groupby("Parent Manufacture")
+                   .agg({"Qty": "sum", "Grsamt": "sum"})
+                   .reset_index())
+        summary.columns = ["Parent Manufacture", "Total Qty", "Total Value"]
 
-def safe_to_datetime(s):
-    try:
-        return parser.parse(str(s), dayfirst=True)
-    except Exception:
-        return pd.NaT
+        # Merge with full company list to include 0-sales companies
+        full_df = pd.DataFrame({"Parent Manufacture": company_list})
+        report2 = full_df.merge(summary, on="Parent Manufacture", how="left").fillna(0)
+        report2["Total Qty"] = report2["Total Qty"].astype(int)
+        report2["Total Value"] = report2["Total Value"].round(2)
+        report2 = report2.sort_values("Total Value", ascending=False)
 
-def prepare_data(df, uploaded_file):
-    # Normalize column names by stripping and replacing newlines
-    df.columns = [str(c).strip() for c in df.columns]
-    # Common expected column name mapping
-    col_map_candidates = {
-        'Product Name': ['Product Name','ProductName','PRODUCT','PRODUCT NAME'],
-        'Qty': ['Qty','QTY','Quantity','QTY '],
-        'Free': ['Free','FREE'],
-        'Rate': ['Rate','RATE'],
-        'GrsAmt': ['GrsAmt','Grs Amt','Gross Amount','GrsAmount','Grs Amt'],
-        'InvNo': ['InvNo','Inv No','Invoice No','InvoiceNumber','Inv #'],
-        'Ledger Account': ['Ledger Account','LedgerAccount','Customer','Name of Customer','Ledger'],
-        'Area': ['Area','AREA','Town'],
-        'City': ['City','CITY'],
-        'Manufacturer / Division': ['Manufacturer / Division','Manufacturer','Division'],
-        'Parent Manufacturer': ['Parent Manufacturer','ParentManufacture','Parent Manufacturer '],
-        'Supplier Name': ['Supplier Name','SupplierName','Supplier']
-    }
-    # Create a reverse lookup
-    col_map = {}
-    for standard, candidates in col_map_candidates.items():
-        for c in df.columns:
-            for cand in candidates:
-                if str(c).strip().lower() == cand.strip().lower():
-                    col_map[c] = standard
+    return report1, report2
 
-    df = df.rename(columns=col_map)
-    # Keep only relevant columns if present
-    needed = ['Product Name','Qty','Free','Rate','GrsAmt','InvNo','Ledger Account','Area','City','Manufacturer / Division','Parent Manufacturer','Supplier Name']
-    for col in needed:
-        if col not in df.columns:
-            df[col] = np.nan
 
-    # Convert Qty and GrsAmt to numeric
-    df['Qty'] = pd.to_numeric(df['Qty'], errors='coerce').fillna(0)
-    df['GrsAmt'] = pd.to_numeric(df['GrsAmt'], errors='coerce').fillna(0)
-    # Try to detect a date column
-    date_cols = [c for c in df.columns if 'date' in str(c).lower() or 'dt' in str(c).lower() or 'invdate' in str(c).lower()]
-    if date_cols:
-        df['__Date'] = pd.to_datetime(df[date_cols[0]], errors='coerce', dayfirst=True)
+# -------------------------
+# Main App Layout
+# -------------------------
+tab1, tab2 = st.tabs(["📂 Upload Files", "📊 Dashboard"])
+
+with tab1:
+    st.header("Upload Excel Files")
+    st.markdown("Upload your **Sales Data** and **All Company List** files below.")
+    col1, col2 = st.columns(2)
+    with col1:
+        sales_file = st.file_uploader("Upload Sales Data Excel", type=["xlsx"], key="sales")
+    with col2:
+        company_file = st.file_uploader("Upload All Company List Excel", type=["xlsx"], key="company")
+
+    if sales_file and company_file:
+        try:
+            df, period = load_sales_data(sales_file)
+            company_list = load_company_list(company_file)
+
+            # Save to session
+            st.session_state["sales_data"] = df
+            st.session_state["period"] = period
+            st.session_state["company_list"] = company_list
+
+            st.success("✅ Files uploaded and processed successfully! Switch to the 'Dashboard' tab to view reports.")
+        except Exception as e:
+            st.error(f"Error reading files: {e}")
     else:
-        # Try to infer from header
-        d1, d2 = infer_date_range_from_header(uploaded_file)
-        if d1 is not None:
-            # put the start date as the date for all rows (best-effort)
-            df['__Date'] = pd.NaT
-            df['__InferredStart'] = d1
-            df['__InferredEnd'] = d2
-        else:
-            df['__Date'] = pd.NaT
+        st.info("Please upload both files to continue.")
 
-    # Create Month column if Date available
-    df['Month'] = df['__Date'].dt.strftime('%Y-%m').fillna('Unknown')
-    return df
+with tab2:
+    if "sales_data" not in st.session_state or "company_list" not in st.session_state:
+        st.warning("⚠️ Please upload files first in the 'Upload Files' tab.")
+        st.stop()
 
-def generate_report1(df_cust):
-    # Group by product and parent manufacturer
-    grp = df_cust.groupby(['Product Name','Parent Manufacturer']).agg(
-        No_of_Instances = ('InvNo','nunique'),
-        Max_Purchases = ('Qty','max'),
-        Avg_Purchases = ('Qty','mean')
-    ).reset_index()
-    grp = grp.sort_values(['No_of_Instances','Avg_Purchases'], ascending=False).reset_index(drop=True)
-    grp.insert(0, 'Sr. No', grp.index+1)
-    return grp
+    df = st.session_state["sales_data"]
+    company_list = st.session_state["company_list"]
+    period = st.session_state.get("period", None)
 
-def generate_report2(df_cust, start_month=None, end_month=None, value_col='Qty'):
-    # If Month is Unknown, then monthly split won't be possible per row
-    if df_cust['Month'].eq('Unknown').all():
-        # fallback: single column for period total
-        total = df_cust.groupby(['Parent Manufacturer']).agg(Total=(value_col,'sum')).reset_index()
-        total.insert(0, 'Sr. No', total.index+1)
-        return total, False
-    else:
-        # Filter by date range if provided (start_month/end_month in 'YYYY-MM' format)
-        df_m = df_cust.copy()
-        if start_month:
-            df_m = df_m[df_m['Month'] >= start_month]
-        if end_month:
-            df_m = df_m[df_m['Month'] <= end_month]
-        pivot = pd.pivot_table(df_m, index=['Parent Manufacturer'], columns='Month', values=value_col, aggfunc='sum', fill_value=0)
-        pivot = pivot.reset_index().rename_axis(None, axis=1)
-        pivot.insert(0, 'Sr. No', range(1, len(pivot)+1))
-        return pivot, True
+    st.header("Customer Purchase Dashboard")
 
-def download_button_df(df, file_name="report.csv"):
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(label=f"Download {file_name}", data=csv, file_name=file_name, mime='text/csv')
+    if period:
+        st.markdown(f"### 📅 Period: {period}")
 
-# UI - Upload
-uploaded_file = st.file_uploader("Upload your Excel (.xlsx) file (upload once every 15 days)", type=['xlsx'])
+    # ---- Filters ----
+    st.subheader("🎯 Filters")
+    customer_names = sorted(df["Ledger Account"].dropna().unique())
+    selected_customer = st.selectbox("Select Customer Name (Ledger Account)", customer_names)
 
-if uploaded_file is not None:
-    df_raw = load_excel(uploaded_file)
-    st.success("✅ Data uploaded successfully (Last updated: {})".format(datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    with st.expander("Preview raw data (first 10 rows)"):
-        st.dataframe(df_raw.head(10))
+    if not selected_customer:
+        st.info("Please select a customer to view reports.")
+        st.stop()
 
-    df = prepare_data(df_raw, uploaded_file)
+    # ---- Reports ----
+    report1, report2 = generate_reports(df, company_list, selected_customer)
 
-    # Sidebar filters
-    st.sidebar.header("Filters")
-    customers = df['Ledger Account'].dropna().unique().tolist()
-    if not customers:
-        st.warning("No customers found in the uploaded file. Please check column names.")
-    selected_customer = st.sidebar.selectbox("Select Customer (Ledger Account)", options=["-- Select --"] + customers)
-    if selected_customer and selected_customer != "-- Select --":
-        df_cust = df[df['Ledger Account'] == selected_customer].copy()
-        st.sidebar.write("Area:", df_cust['Area'].dropna().unique().tolist())
-        st.write(f"## Reports for customer: {selected_customer}")
+    st.subheader("📈 Report 1️⃣: Frequent Purchases (Sorted by Avg Purchases ↓)")
+    st.dataframe(report1, use_container_width=True, hide_index=True)
 
-        # Report 1
-        st.write("### Report 1 — Frequent Purchases")
-        rpt1 = generate_report1(df_cust)
-        st.dataframe(rpt1)
-        download_button_df(rpt1, f"{selected_customer}_frequent_purchases.csv")
+    st.subheader("🏢 Report 2️⃣: Company-wise Purchases (Includes Zero-Sales Companies ↓)")
+    st.dataframe(report2, use_container_width=True, hide_index=True)
 
-        # Report 2
-        st.write("### Report 2 — Company-wise Monthly Purchases")
-        # Month selectors: get unique months sorted
-        months = sorted(df['Month'].dropna().unique())
-        # If months include 'Unknown', exclude for selector but keep for fallback
-        month_options = [m for m in months if m != 'Unknown']
-        if month_options:
-            col1, col2 = st.columns(2)
-            with col1:
-                start = st.selectbox("From (YYYY-MM)", options=["--"] + month_options, index=0)
-            with col2:
-                end = st.selectbox("To (YYYY-MM)", options=["--"] + month_options, index=len(month_options)-1 if month_options else 0)
-            start_sel = None if start == "--" else start
-            end_sel = None if end == "--" else end
-        else:
-            start_sel = end_sel = None
-
-        pivot, monthly_available = generate_report2(df_cust, start_sel, end_sel, value_col='Qty')
-        if not monthly_available:
-            st.info("Monthly breakdown unavailable: no per-row date column found. Showing totals for the uploaded period.")
-        st.dataframe(pivot)
-        download_button_df(pivot, f"{selected_customer}_company_monthly.csv")
-
-        # Optional: a simple bar chart for top products
-        if not df_cust.empty:
-            st.write("### Top products by total quantity")
-            top_products = df_cust.groupby('Product Name').agg(TotalQty=('Qty','sum')).reset_index().sort_values('TotalQty', ascending=False).head(10)
-            fig = px.bar(top_products, x='Product Name', y='TotalQty', title='Top 10 Products (by Qty)')
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Please select a customer from the sidebar to view the reports.")
-else:
-    st.info("Upload a distributor Excel file to begin. Data is expected to start at row 4 (skip first three rows).")
+    st.markdown("---")
+    st.caption("Created by Jinesh • Powered by Streamlit ✨")
