@@ -1,0 +1,35 @@
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.log
+*.tmp
+*.swp
+
+# Jupyter / notebook stuff
+.ipynb_checkpoints
+
+# Virtual environments
+venv/
+env/
+.cpvenv/
+.cpdenv/
+cpd/
+
+# Streamlit logs and cache
+.streamlit/logs/
+.streamlit/cache/
+.streamlit/secrets.toml
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Data folder (optional — uncomment if you don’t want local uploaded Excel files in repo)
+# data/
+
+# Environment files
+.env
+*.env
