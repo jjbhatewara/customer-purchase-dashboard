@@ -1,12 +1,20 @@
 import os
 import re
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
+
 import pandas as pd
 import streamlit as st
 
-# ---------- CONFIG ----------
-st.set_page_config(page_title="Customer Purchase Dashboard", layout="wide", page_icon="📊")
-st.markdown("""
+# ============== PAGE CONFIG + THEME ==============
+st.set_page_config(
+    page_title="Customer Purchase Dashboard",
+    layout="wide",
+    page_icon="📊"
+)
+
+st.markdown(
+    """
     <style>
         body {background-color: #0E1117; color: #FAFAFA;}
         .stApp {background-color: #0E1117;}
@@ -15,220 +23,555 @@ st.markdown("""
         h1, h2, h3, h4, h5 {color: #00B4D8;}
         table {color: #FAFAFA !important;}
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True
+)
 
-# ---------- PATHS ----------
+# ============== FULL PAGE LOADER OVERLAY ==============
+loader_html = """
+<style>
+#overlay-loader {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(14, 17, 23, 0.85);
+    backdrop-filter: blur(2px);
+    z-index: 999999;
+    display: none;
+}
+.loader-spinner {
+    border: 10px solid #2c2c2c;
+    border-top: 10px solid #00B4D8;
+    border-radius: 50%;
+    width: 120px;
+    height: 120px;
+    animation: spin 0.9s linear infinite;
+    position: absolute;
+    top: 45%;
+    left: 45%;
+}
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+</style>
+
+<div id="overlay-loader">
+    <div class="loader-spinner"></div>
+</div>
+
+<script>
+function showLoader() {
+    const el = document.getElementById("overlay-loader");
+    if (el) { el.style.display = "block"; }
+}
+function hideLoader() {
+    const el = document.getElementById("overlay-loader");
+    if (el) { el.style.display = "none"; }
+}
+</script>
+"""
+st.markdown(loader_html, unsafe_allow_html=True)
+
+# ============== PATHS + DB INIT ==============
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
-SALES_FILE = os.path.join(DATA_DIR, "sales_data.xlsx")
-COMPANY_FILE = os.path.join(DATA_DIR, "company_list.xlsx")
+DB_PATH = os.path.join(DATA_DIR, "dashboard.db")
 
-# ---------- HELPERS ----------
-def detect_header_row(path_or_buffer):
-    preview = pd.read_excel(path_or_buffer, header=None, nrows=8)
+
+@st.cache_resource
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        create table if not exists sales (
+            id integer primary key autoincrement,
+            product_name text,
+            qty real,
+            free_qty real,
+            rate real,
+            value real,
+            inv_no text,
+            inv_date text,
+            ledger_account text,
+            area text,
+            city text,
+            mobile text,
+            parent_manufacturer text,
+            manufacturer_division text,
+            supplier_name text
+        )
+        """
+    )
+    cur.execute(
+        """
+        create table if not exists companies (
+            id integer primary key autoincrement,
+            parent_manufacturer text unique
+        )
+        """
+    )
+    conn.commit()
+
+
+init_db()
+
+# ============== EXCEL PARSING HELPERS ==============
+
+
+def detect_header_row(file):
+    if hasattr(file, "seek"):
+        file.seek(0)
+    preview = pd.read_excel(file, header=None, nrows=8)
     for i in range(len(preview)):
         row = preview.iloc[i].astype(str).str.lower()
         rowtext = " ".join(row.tolist())
-        if any(k in rowtext for k in ["product", "qty", "ledger", "invoice", "inv no", "invno"]):
+        if any(
+            k in rowtext
+            for k in ["product", "qty", "ledger", "invdate", "inv date", "invno", "invoice", "inv no"]
+        ):
+            if hasattr(file, "seek"):
+                file.seek(0)
             return i
+    if hasattr(file, "seek"):
+        file.seek(0)
     return 0
+
 
 def normalize_columns(df):
     col_map = {}
     for col in df.columns:
         c = str(col).strip().lower()
-        if re.search(r'product', c):
-            col_map[col] = "Product Name"; continue
-        if re.search(r'\b(qty|quantity|qty\.)\b', c):
-            col_map[col] = "Qty"; continue
-        if re.search(r'\bfree\b', c):
-            col_map[col] = "Free"; continue
-        if re.search(r'\brate\b', c):
-            col_map[col] = "Rate"; continue
-        if re.search(r'grs|gross|grsamt|amount|value|amount\s*\(|gross\s*amt', c):
-            col_map[col] = "Value"; continue
-        if re.search(r'inv|invoice', c):
-            col_map[col] = "InvNo"; continue
-        if re.search(r'ledger|customer|retailer|party|name of customer', c):
-            col_map[col] = "Ledger Account"; continue
-        if re.search(r'parent|parent\s*manufacturer|parentmanufacturer|parent manufact', c):
-            col_map[col] = "Parent Manufacturer"; continue
-        if re.search(r'manufacturer|division', c):
-            col_map[col] = "Manufacturer / Division"; continue
-        if re.search(r'\barea\b', c):
-            col_map[col] = "Area"; continue
-        if re.search(r'\bcity\b', c):
-            col_map[col] = "City"; continue
-        if re.search(r'mobile|contact', c):
-            col_map[col] = "Mobile Number"; continue
-    df = df.rename(columns=col_map)
-    return df
 
-def read_sales_file(path):
-    header_row = detect_header_row(path)
-    raw = pd.read_excel(path, header=None)
-    period_text = " ".join(raw.iloc[0:4, :].astype(str).fillna("").apply(lambda r: " ".join(r), axis=1).tolist())
-    period = None
-    m = re.search(r'from\s*[:\-]?\s*(\d{1,2}[\/\-\.\s]\d{1,2}[\/\-\.\s]\d{2,4}).*upto\s*[:\-]?\s*(\d{1,2}[\/\-\.\s]\d{1,2}[\/\-\.\s]\d{2,4})', period_text, re.IGNORECASE)
-    if m:
-        period = f"{m.group(1).strip()} → {m.group(2).strip()}"
+        if "product" in c:
+            col_map[col] = "Product Name"
+            continue
+        if re.search(r"\b(qty|quantity)\b", c):
+            col_map[col] = "Qty"
+            continue
+        if "free" in c:
+            col_map[col] = "Free"
+            continue
+        if "rate" in c:
+            col_map[col] = "Rate"
+            continue
+        if re.search(r"grs|gross|grsamt|amount|value", c):
+            col_map[col] = "Value"
+            continue
+        if "invdate" in c or "inv date" in c or "invoice date" in c:
+            col_map[col] = "InvDate"
+            continue
+        if ("inv" in c or "invoice" in c) and "date" not in c:
+            col_map[col] = "InvNo"
+            continue
+        if "ledger" in c or "customer" in c or "party" in c:
+            col_map[col] = "Ledger Account"
+            continue
+        if "area" in c:
+            col_map[col] = "Area"
+            continue
+        if "city" in c:
+            col_map[col] = "City"
+            continue
+        if "mobile" in c or "phone" in c or "contact" in c:
+            col_map[col] = "Mobile"
+            continue
+        if "parent" in c and "manufact" in c:
+            col_map[col] = "Parent Manufacturer"
+            continue
+        if "manufacturer / division" in c or ("manufacturer" in c and "division" in c):
+            col_map[col] = "Manufacturer / Division"
+            continue
+        if "supplier" in c:
+            col_map[col] = "Supplier Name"
+            continue
 
-    df = pd.read_excel(path, header=header_row)
+    return df.rename(columns=col_map)
+
+
+def parse_sales_excel(uploaded_file):
+    header_row = detect_header_row(uploaded_file)
+    df = pd.read_excel(uploaded_file, header=header_row)
+
     df.columns = [str(c).strip() for c in df.columns]
     df = normalize_columns(df)
 
-    required_cols = [
-        "Product Name", "Qty", "Value", "InvNo",
-        "Ledger Account", "Parent Manufacturer",
-        "Area", "City", "Mobile Number"
+    required = [
+        "Product Name",
+        "Qty",
+        "Free",
+        "Rate",
+        "Value",
+        "InvNo",
+        "InvDate",
+        "Ledger Account",
+        "Area",
+        "City",
+        "Mobile",
+        "Parent Manufacturer",
+        "Manufacturer / Division",
+        "Supplier Name",
     ]
-    for needed in required_cols:
-        if needed not in df.columns:
-            df[needed] = pd.NA
+    for c in required:
+        if c not in df.columns:
+            df[c] = pd.NA
 
     df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
+    df["Free"] = pd.to_numeric(df["Free"], errors="coerce").fillna(0)
+    df["Rate"] = pd.to_numeric(df["Rate"], errors="coerce").fillna(0)
     df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0)
-    df["Ledger Account"] = df["Ledger Account"].astype(str).str.strip()
-    df["Parent Manufacturer"] = df["Parent Manufacturer"].astype(str).str.strip()
-    df["InvNo"] = df["InvNo"].astype(str).str.strip()
-    return df, period
 
-def read_company_list(path):
-    header_row = detect_header_row(path)
-    df = pd.read_excel(path, header=header_row)
-    cols = df.columns.tolist()
+    df["InvDate"] = pd.to_datetime(df["InvDate"], errors="coerce", dayfirst=True)
+
+    for c in required:
+        if c not in ["Qty", "Free", "Rate", "Value", "InvDate"]:
+            df[c] = df[c].astype(str).str.strip()
+
+    return df
+
+
+def insert_sales_df(df):
+    if df.empty:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+
+    rows = []
+    for _, row in df.iterrows():
+        rows.append(
+            (
+                row["Product Name"],
+                float(row["Qty"]),
+                float(row["Free"]),
+                float(row["Rate"]),
+                float(row["Value"]),
+                row["InvNo"],
+                row["InvDate"].strftime("%Y-%m-%d") if pd.notna(row["InvDate"]) else None,
+                row["Ledger Account"],
+                row["Area"],
+                row["City"],
+                row["Mobile"],
+                row["Parent Manufacturer"],
+                row["Manufacturer / Division"],
+                row["Supplier Name"],
+            )
+        )
+
+    cur.executemany(
+        """
+        insert into sales (
+            product_name,
+            qty,
+            free_qty,
+            rate,
+            value,
+            inv_no,
+            inv_date,
+            ledger_account,
+            area,
+            city,
+            mobile,
+            parent_manufacturer,
+            manufacturer_division,
+            supplier_name
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def parse_company_excel(uploaded_file):
+    header_row = detect_header_row(uploaded_file)
+    df = pd.read_excel(uploaded_file, header=header_row)
     companies = []
-    for col in cols[:2]:
+    for col in df.columns[:2]:
         companies.extend(df[col].dropna().astype(str).str.strip().tolist())
-    companies = [c.upper() for c in companies if str(c).strip() != ""]
-    return sorted(list(dict.fromkeys(companies)))
+    companies = [c.upper() for c in companies if c]
+    companies = sorted(list(dict.fromkeys(companies)))
+    return companies
 
-def ensure_required_columns_present(df, required):
-    return [c for c in required if c not in df.columns]
 
-# ---------- REPORTS ----------
-def generate_report1(df_cust):
-    if df_cust.empty:
-        return pd.DataFrame(columns=["Sr. No", "Product Name", "Parent Manufacturer", "No. of Instances", "Max Purchases", "Avg Purchases"])
-    grp = df_cust.groupby(["Product Name", "Parent Manufacturer"]).agg(
-        No_of_Instances=("InvNo", lambda s: s.nunique() if s.notna().any() else s.shape[0]),
-        Max_Purchases=("Qty", "max"),
-        Avg_Purchases=("Qty", "mean")
+def replace_companies(companies):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("delete from companies")
+    cur.executemany("insert into companies(parent_manufacturer) values (?)", [(c,) for c in companies])
+    conn.commit()
+
+# ============== LOAD DATA FROM DB ==============
+
+
+def load_sales():
+    conn = get_conn()
+    df = pd.read_sql_query("select * from sales", conn)
+    if df.empty:
+        return df
+    df["InvDate"] = pd.to_datetime(df["inv_date"], errors="coerce")
+    df["Month"] = df["InvDate"].dt.to_period("M").astype(str)
+    df["qty_eff"] = df["qty"].fillna(0) + df["free_qty"].fillna(0)
+    return df
+
+
+def load_companies():
+    conn = get_conn()
+    df = pd.read_sql_query("select parent_manufacturer from companies", conn)
+    return df["parent_manufacturer"].tolist()
+
+# ============== REPORTS ==============
+
+
+def report1(df):
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Sr. No",
+                "Product Name",
+                "Parent Manufacturer",
+                "No. of Instances",
+                "Max Purchases",
+                "Avg Purchases",
+            ]
+        )
+
+    g = df.groupby(["product_name", "parent_manufacturer"]).agg(
+        No_of_Instances=("inv_no", lambda x: x.nunique()),
+        Max_Purchases=("qty_eff", "max"),
+        Avg_Purchases=("qty_eff", "mean"),
     ).reset_index()
-    grp["Avg_Purchases"] = grp["Avg_Purchases"].round(2)
-    grp = grp.sort_values("Avg_Purchases", ascending=False).reset_index(drop=True)
-    grp.insert(0, "Sr. No", grp.index + 1)
-    return grp
 
-def generate_report2(df_cust, company_list):
-    summary = (df_cust.groupby("Parent Manufacturer")
-               .agg(Total_Qty=("Qty", "sum"), Total_Value=("Value", "sum"))
-               .reset_index())
-    summary["Parent Manufacturer"] = summary["Parent Manufacturer"].astype(str).str.upper()
-    full = pd.DataFrame({"Parent Manufacturer": [c.upper() for c in company_list]})
-    merged = full.merge(summary, on="Parent Manufacturer", how="left").fillna(0)
-    merged["Total_Qty"] = merged["Total_Qty"].astype(int)
-    merged["Total_Value"] = merged["Total_Value"].astype(float).round(2)
-    merged = merged.sort_values("Total_Value", ascending=False).reset_index(drop=True)
+    g["Avg_Purchases"] = g["Avg_Purchases"].round(2)
+    g = g.sort_values("Avg_Purchases", ascending=False).reset_index(drop=True)
+    g.insert(0, "Sr. No", g.index + 1)
+
+    g = g.rename(
+        columns={
+            "product_name": "Product Name",
+            "parent_manufacturer": "Parent Manufacturer",
+        }
+    )
+
+    return g
+
+
+def report2(df, companies):
+    base = pd.DataFrame({"Parent Manufacturer": companies})
+
+    if df.empty:
+        base["Total Qty"] = 0
+        base["Total Value"] = 0.0
+        base.insert(0, "Sr. No", base.index + 1)
+        return base
+
+    g = df.groupby("parent_manufacturer").agg(
+        Total_Qty=("qty_eff", "sum"),
+        Total_Value=("value", "sum"),
+    ).reset_index()
+
+    g["parent_manufacturer"] = g["parent_manufacturer"].astype(str).str.upper()
+
+    merged = base.merge(
+        g.rename(columns={"parent_manufacturer": "Parent Manufacturer"}),
+        on="Parent Manufacturer",
+        how="left",
+    ).fillna(0)
+
+    merged["Total_Qty"] = merged["Total_Qty"].astype(float)
+    merged["Total_Value"] = merged["Total_Value"].astype(float)
+
+    merged = merged.rename(
+        columns={
+            "Total_Qty": "Total Qty",
+            "Total_Value": "Total Value",
+        }
+    )
+
+    if "Total Value" in merged.columns:
+        merged = merged.sort_values("Total Value", ascending=False).reset_index(drop=True)
     merged.insert(0, "Sr. No", merged.index + 1)
+
     return merged
 
-# ---------- UI ----------
-st.title("📊 Customer Purchase Dashboard (Persistent Data)")
-tab1, tab2 = st.tabs(["🗂️ Upload Files", "📈 Dashboard"])
+# ============== UI ==============
 
-with tab1:
-    st.header("Upload / Replace Files (Persisted for all users)")
-    st.markdown("Upload Sales Data and All Company List. Files are saved in the app `data/` folder and will be used by everyone until replaced.")
-    uploaded_sales = st.file_uploader("Upload Sales Data (.xlsx)", type=["xlsx"], key="u_sales")
-    uploaded_company = st.file_uploader("Upload Company List (.xlsx)", type=["xlsx"], key="u_company")
+st.title("Customer Purchase Dashboard")
 
-    if uploaded_sales:
-        with open(SALES_FILE, "wb") as f:
-            f.write(uploaded_sales.getbuffer())
-        st.success("✅ Sales file saved.")
+tab_dash, tab_upload = st.tabs(["Dashboard", "Upload Data"])
 
-    if uploaded_company:
-        with open(COMPANY_FILE, "wb") as f:
-            f.write(uploaded_company.getbuffer())
-        st.success("✅ Company list file saved.")
+# ---------- TAB: DASHBOARD ----------
+with tab_dash:
+    st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+    df = load_sales()
+    companies = load_companies()
+    st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
 
-    if os.path.exists(SALES_FILE) and os.path.exists(COMPANY_FILE):
-        t_sales = datetime.fromtimestamp(os.path.getmtime(SALES_FILE)).strftime("%Y-%m-%d %H:%M:%S")
-        t_comp = datetime.fromtimestamp(os.path.getmtime(COMPANY_FILE)).strftime("%Y-%m-%d %H:%M:%S")
-        st.info(f"Files loaded. Sales updated: {t_sales} | Company list updated: {t_comp}")
+    if df.empty:
+        st.warning("No sales data available. Upload sales files in the Upload Data tab.")
+        
     else:
-        st.warning("Please upload both files to enable Dashboard.")
+        st.subheader("Filters")
 
-with tab2:
-    if not (os.path.exists(SALES_FILE) and os.path.exists(COMPANY_FILE)):
-        st.warning("No persisted files found. Upload files first.")
-        st.stop()
+        min_d = df["InvDate"].min()
+        max_d = df["InvDate"].max()
 
-    sales_df, period = read_sales_file(SALES_FILE)
-    company_list = read_company_list(COMPANY_FILE)
+        if pd.isna(min_d) or pd.isna(max_d):
+            st.warning("InvDate missing in data. Date filter disabled.")
+            date_filtered_df = df.copy()
+        else:
+            today = datetime.today().date()
+            one_month_ago = today - timedelta(days=30)
 
-    required = ["Ledger Account", "Parent Manufacturer", "Qty", "Value"]
-    missing = ensure_required_columns_present(sales_df, required)
-    if missing:
-        st.error(f"Missing required columns: {missing}")
-        st.stop()
+            # Raw desired range
+            raw_from = one_month_ago
+            raw_to = today
 
-    if period:
-        st.markdown(f"### 📅 Period: {period}")
+            # Clamp inside data range
+            default_from = max(min_d.date(), raw_from)
+            default_from = min(default_from, max_d.date())
 
-    # Build unique dropdown display
-    for col in ["Area", "City", "Mobile Number"]:
-        if col not in sales_df.columns:
-            sales_df[col] = ""
-        sales_df[col] = sales_df[col].fillna("").astype(str)
+            default_to = max(min_d.date(), raw_to)
+            default_to = min(default_to, max_d.date())
 
-    sales_df["Customer_Display"] = (
-        sales_df["Ledger Account"].astype(str)
-        + " (" + sales_df["Area"] + ", " + sales_df["City"] + ") – "
-        + sales_df["Mobile Number"]
-    )
+            # Safety: if from > to, fall back to full data range
+            if default_from > default_to:
+                default_from = min_d.date()
+                default_to = max_d.date()
 
-    sales_df["Customer_ID"] = (
-        sales_df["Ledger Account"].astype(str)
-        + "|" + sales_df["Area"].astype(str)
-        + "|" + sales_df["City"].astype(str)
-        + "|" + sales_df["Mobile Number"].astype(str)
-    )
+            col1, col2 = st.columns(2)
+            with col1:
+                from_date = st.date_input(
+                    "From Date",
+                    value=default_from,
+                    min_value=min_d.date(),
+                    max_value=max_d.date(),
+                )
+            with col2:
+                to_date = st.date_input(
+                    "To Date",
+                    value=default_to,
+                    min_value=min_d.date(),
+                    max_value=max_d.date(),
+                )
 
-    customer_display_map = (
-        sales_df[["Customer_ID", "Customer_Display"]]
-        .drop_duplicates()
-        .sort_values("Customer_Display")
-    )
+            st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+            mask = (df["InvDate"].dt.date >= from_date) & (df["InvDate"].dt.date <= to_date)
+            date_filtered_df = df[mask]
+            st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
 
-    if customer_display_map.empty:
-        st.warning("No customers found.")
-        st.stop()
+        if date_filtered_df.empty:
+            st.warning("No data in this date range.")
+            st.stop()
 
-    selected_display = st.selectbox(
-        "Select Customer (Name, Area, City, Mobile)",
-        customer_display_map["Customer_Display"]
-    )
+        for c in ["ledger_account", "area", "city", "mobile"]:
+            if c not in date_filtered_df.columns:
+                date_filtered_df[c] = ""
+            date_filtered_df[c] = date_filtered_df[c].fillna("").astype(str)
 
-    selected_id = customer_display_map.loc[
-        customer_display_map["Customer_Display"] == selected_display, "Customer_ID"
-    ].values[0]
-    ledger, area, city, mobile = selected_id.split("|")
+        date_filtered_df["Customer_Display"] = (
+            date_filtered_df["ledger_account"]
+            + " | "
+            + date_filtered_df["area"]
+            + " | "
+            + date_filtered_df["city"]
+            + " | "
+            + date_filtered_df["mobile"]
+        )
+        date_filtered_df["Customer_ID"] = (
+            date_filtered_df["ledger_account"]
+            + "|"
+            + date_filtered_df["area"]
+            + "|"
+            + date_filtered_df["city"]
+            + "|"
+            + date_filtered_df["mobile"]
+        )
 
-    cust_df = sales_df[
-        (sales_df["Ledger Account"] == ledger)
-        & (sales_df["Area"] == area)
-        & (sales_df["City"] == city)
-        & (sales_df["Mobile Number"] == mobile)
-    ]
+        cust_map = (
+            date_filtered_df[["Customer_ID", "Customer_Display"]]
+            .drop_duplicates()
+            .sort_values("Customer_Display")
+        )
 
-    st.subheader("Report 1 — Frequent Purchases (sorted by Avg Purchases ↓)")
-    rpt1 = generate_report1(cust_df)
-    st.dataframe(rpt1, use_container_width=True, hide_index=True)
+        if cust_map.empty:
+            st.warning("No customers in this filtered data.")
+            st.stop()
 
-    st.subheader("Report 2 — Company-wise Purchases (includes 0-sales companies, sorted by Total Value ↓)")
-    rpt2 = generate_report2(cust_df, company_list)
-    st.dataframe(rpt2, use_container_width=True, hide_index=True)
+        selected_display = st.selectbox("Select Customer", cust_map["Customer_Display"])
+
+        st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+        selected_id = cust_map.loc[
+            cust_map["Customer_Display"] == selected_display, "Customer_ID"
+        ].values[0]
+        ledger, area, city, mobile = selected_id.split("|")
+
+        df_cust = date_filtered_df[
+            (date_filtered_df["ledger_account"] == ledger)
+            & (date_filtered_df["area"] == area)
+            & (date_filtered_df["city"] == city)
+            & (date_filtered_df["mobile"] == mobile)
+        ]
+        st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
+
+        st.subheader("Report 1: Frequent Purchases")
+        st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+        r1 = report1(df_cust)
+        st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
+        st.dataframe(r1, use_container_width=True, hide_index=True)
+
+        st.subheader("Report 2: Company wise Purchases")
+        st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+        if companies:
+            r2 = report2(df_cust, companies)
+        else:
+            r2 = pd.DataFrame(columns=["Sr. No", "Parent Manufacturer", "Total Qty", "Total Value"])
+        st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
+        st.dataframe(r2, use_container_width=True, hide_index=True)
 
     st.caption("Created by Jinesh | Sanjay Distributors")
+
+# ---------- TAB: UPLOAD DATA ----------
+with tab_upload:
+    st.header("Upload Sales Files (data is appended to database)")
+    files = st.file_uploader("Upload Excel Files", type=["xlsx"], accept_multiple_files=True)
+
+    if files:
+        st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+        for f in files:
+            df_new = parse_sales_excel(f)
+            insert_sales_df(df_new)
+        st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
+        st.success("All sales files processed and added to database.")
+
+    st.divider()
+    st.header("Upload Company List")
+    comp_file = st.file_uploader("Upload Company List", type=["xlsx"])
+
+    if comp_file:
+        st.markdown("<script>showLoader()</script>", unsafe_allow_html=True)
+        comps = parse_company_excel(comp_file)
+        replace_companies(comps)
+        st.markdown("<script>hideLoader()</script>", unsafe_allow_html=True)
+        st.success(f"{len(comps)} companies saved to database.")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("select count(*) from sales")
+    total_sales = cur.fetchone()[0]
+    cur.execute("select count(*) from companies")
+    total_comp = cur.fetchone()[0]
+
+    if total_sales == 0 and total_comp == 0:
+        st.warning("No files uploaded yet. Please upload sales data and the company list to start.")
+    elif total_sales == 0:
+        st.warning("No sales data uploaded yet. Please upload one or more sales Excel files.")
+    elif total_comp == 0:
+        st.warning("Sales data is present, but no company list uploaded yet. Please upload the company list.")
+    else:
+        st.info(f"Database status: {total_sales} sales rows, {total_comp} companies.")
